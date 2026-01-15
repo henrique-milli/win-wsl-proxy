@@ -28,12 +28,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         print(f"[{timestamp}] CONNECT {host}:{port} from {self.client_address[0]}")
         
         try:
-            # Create connection to target
+            # Create connection to target with performance optimizations
             target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             target_sock.settimeout(30)  # Increased timeout for slow connections
+            
+            # Performance optimizations: disable Nagle's algorithm for low latency
+            target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Enable keep-alive for better connection management
+            target_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Increase socket buffer sizes for better throughput
+            target_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            target_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            
             print(f"[{timestamp}] Connecting to {host}:{port}...")
             target_sock.connect((host, port))
             print(f"[{timestamp}] Connected to {host}:{port}, tunneling...")
+            
+            # Optimize client connection socket as well
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
             
             # Send 200 Connection Established
             self.send_response(200, 'Connection Established')
@@ -59,16 +74,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         sockets = [client, server]
         bytes_sent = 0
         bytes_received = 0
+        # Use larger buffer for better throughput (64KB)
+        BUFFER_SIZE = 65536
+        # Reduced timeout for lower latency (0.1s instead of 1s)
+        SELECT_TIMEOUT = 0.1
         try:
             while True:
-                readable, _, exceptional = select.select(sockets, [], sockets, 1)
+                readable, _, exceptional = select.select(sockets, [], sockets, SELECT_TIMEOUT)
                 if exceptional:
                     break
                 if not readable:
                     continue
                 
                 for sock in readable:
-                    data = sock.recv(8192)
+                    data = sock.recv(BUFFER_SIZE)
                     if not data:
                         return
                     if sock is client:
@@ -120,10 +139,17 @@ if __name__ == '__main__':
     # Default port is 3128 if no argument provided
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 3128
     
-    with socketserver.TCPServer(("0.0.0.0", port), ProxyHandler) as httpd:
+    # Use ThreadingMixIn to handle multiple concurrent connections
+    # This is important for Maven which makes many parallel requests
+    class ThreadingProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+    
+    with ThreadingProxyServer(("0.0.0.0", port), ProxyHandler) as httpd:
         print(f"HTTP/HTTPS Proxy server running on port {port}")
         print("Press Ctrl+C to stop")
         print(f"Listening on 0.0.0.0:{port} (accessible from WSL2)")
+        print("Performance optimizations: TCP_NODELAY, larger buffers, threading enabled")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
